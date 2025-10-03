@@ -1,89 +1,110 @@
-import os
-import torch
+import os, cv2, random, torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
-from torchvision import datasets, transforms, models
+from torchvision import transforms, models
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
 
-# ✅ Config
-DATASET_ROOT = "/content/drive/MyDrive/celebdf"  # change if needed
-CHECKPOINT_DIR = "checkpoints"
-EPOCHS = 15
-BATCH_SIZE = 16
-LR = 1e-4
-VAL_SPLIT = 0.15
+# --------------------------
+# Dataset loader
+# --------------------------
+class VideoFrameDataset(Dataset):
+    def __init__(self, root, transform=None, frames_per_video=10, max_frames=100):
+        self.samples = []
+        self.transform = transform
+        self.frames_per_video = frames_per_video
+        self.max_frames = max_frames
+        classes = {"real":0, "fake":1}
 
+        for label in classes:
+            folder = os.path.join(root, label)
+            for file in os.listdir(folder):
+                if file.endswith(".mp4"):
+                    self.samples.append((os.path.join(folder, file), classes[label]))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        video_path, label = self.samples[idx]
+        cap = cv2.VideoCapture(video_path)
+        frames = []
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        # Pick random frame indices
+        if total_frames > 0:
+            frame_indices = sorted(random.sample(
+                range(min(total_frames, self.max_frames)), 
+                min(self.frames_per_video, total_frames)
+            ))
+        else:
+            frame_indices = []
+
+        count, selected = 0, []
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if count in frame_indices:
+                img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                if self.transform:
+                    img = self.transform(img)
+                selected.append(img)
+            count += 1
+        cap.release()
+
+        if len(selected) == 0:
+            selected = [torch.zeros(3,224,224)]
+
+        # stack → average frames to 1 tensor
+        video_tensor = torch.stack(selected).mean(0)
+        return video_tensor, label
+
+# --------------------------
+# Training
+# --------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Device:", device)
 
-# ✅ Create transform
 transform = transforms.Compose([
-    transforms.Resize((299, 299)),
+    transforms.Resize((224,224)),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
+    transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
 ])
 
-# ✅ Load dataset
-full_dataset = datasets.ImageFolder(DATASET_ROOT, transform=transform)
+# Change path to full dataset root
+DATASET_ROOT = "/content/drive/MyDrive/celebdf"  
+dataset = VideoFrameDataset(DATASET_ROOT, transform=transform, frames_per_video=10)
+train_loader = DataLoader(dataset, batch_size=8, shuffle=True, num_workers=2)
 
-# Train/val split
-val_size = int(len(full_dataset) * VAL_SPLIT)
-train_size = len(full_dataset) - val_size
-train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
-
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
-
-# ✅ Model (EfficientNet-B0 fine-tuned)
-model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
+model = models.efficientnet_b0(pretrained=True)
 in_features = model.classifier[1].in_features
-model.classifier[1] = nn.Linear(in_features, 2)  # binary classification
+model.classifier[1] = nn.Linear(in_features, 2)
 model = model.to(device)
 
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=LR)
+optimizer = optim.Adam(model.parameters(), lr=1e-4)
 
-# ✅ Training loop
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-best_val_acc = 0.0
-
+EPOCHS = 5  # can increase if GPU allows
 for epoch in range(EPOCHS):
     model.train()
-    correct, total, train_loss = 0, 0, 0.0
-    for imgs, labels in train_loader:
-        imgs, labels = imgs.to(device), labels.to(device)
+    total, correct = 0, 0
+    for inputs, labels in train_loader:
+        inputs, labels = inputs.to(device), labels.to(device)
         optimizer.zero_grad()
-        outputs = model(imgs)
+        outputs = model(inputs)
         loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
-        
-        train_loss += loss.item()
-        _, predicted = outputs.max(1)
+
+        _, preds = torch.max(outputs, 1)
+        correct += (preds == labels).sum().item()
         total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
-    
-    train_acc = 100. * correct / total
-    avg_loss = train_loss / len(train_loader)
 
-    # ✅ Validation
-    model.eval()
-    val_correct, val_total = 0, 0
-    with torch.no_grad():
-        for imgs, labels in val_loader:
-            imgs, labels = imgs.to(device), labels.to(device)
-            outputs = model(imgs)
-            _, predicted = outputs.max(1)
-            val_total += labels.size(0)
-            val_correct += predicted.eq(labels).sum().item()
-    val_acc = 100. * val_correct / val_total
+    acc = 100 * correct / total
+    print(f"Epoch {epoch+1}/{EPOCHS}, Accuracy: {acc:.2f}%")
 
-    print(f"Epoch {epoch+1}/{EPOCHS}, Train Loss: {avg_loss:.4f}, Train Acc: {train_acc:.2f}%, Val Acc: {val_acc:.2f}%")
-
-    # Save best model
-    if val_acc > best_val_acc:
-        best_val_acc = val_acc
-        torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, "finetuned_full.pth"))
-        print(f"✅ Saved best model (val acc {val_acc:.2f}%)")
-
-print("Training complete. Best Val Acc:", best_val_acc)
+# Save model
+os.makedirs("checkpoints", exist_ok=True)
+torch.save(model.state_dict(), "checkpoints/finetuned_full.pth")
+print("✅ Model saved at checkpoints/finetuned_full.pth")
