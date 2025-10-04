@@ -8,10 +8,9 @@ import json
 # Permanent paths on Google Drive
 # -----------------------------
 DRIVE_ROOT = "/content/drive/MyDrive/deepfake-detection-videos"
-DATA_ROOT = os.path.join(DRIVE_ROOT, "celebdf_frames")
+DATA_ROOT = "/content/drive/MyDrive/celebdf_frames"
 OUT_DIR = os.path.join(DRIVE_ROOT, "results_images")
 CHECKPOINT_DIR = os.path.join(DRIVE_ROOT, "checkpoints")
-
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 os.makedirs(OUT_DIR, exist_ok=True)
 
