@@ -42,9 +42,9 @@ n_test = n - n_train - n_val
 train_set, val_set, test_set = random_split(dataset, [n_train, n_val, n_test])
 
 batch_size = 64
-train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=4)
-val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=4)
-test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=4)
+train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=2)
+val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=2)
+test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=2)
 
 # -----------------------------
 # Model setup
