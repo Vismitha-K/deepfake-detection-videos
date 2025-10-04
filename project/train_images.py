@@ -49,11 +49,23 @@ test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_wor
 # -----------------------------
 # Model setup
 # -----------------------------
-model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
+from torchvision.models import efficientnet_b0
+import torch.nn as nn
+import torch
+
+weights_path = "/content/drive/MyDrive/model_weights/efficientnet_b0_rwightman-7f5810bc.pth"
+
+# Load pretrained EfficientNet-B0 weights from Drive
+model = efficientnet_b0(weights=None)
+state_dict = torch.load(weights_path, map_location=device)
+model.load_state_dict(state_dict)
+
+# Replace classifier head for binary classification (REAL vs FAKE)
 in_features = model.classifier[1].in_features
 model.classifier[1] = nn.Linear(in_features, 2)
 model = model.to(device)
 
+# Loss, optimizer, and training setup
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=1e-4)
 epochs = 8
