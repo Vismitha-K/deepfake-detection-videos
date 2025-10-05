@@ -106,14 +106,14 @@ if uploaded_file:
             per_frame_scores.append(prob_fake)
 
         avg_prob_fake = float(np.mean(per_frame_scores)) if per_frame_scores else 0.0
-        verdict = "🟢 REAL" if avg_prob_fake < 0.5 else "🔴 FAKE"
+        verdict = "🔴 FAKE" if avg_prob_fake < 0.5 else "🟢 REAL"
         time.sleep(1)
 
     # -------------------------------
     # Display Results
     # -------------------------------
     st.subheader("📊 Detection Summary")
-    st.markdown(f"### Final Verdict: **{verdict}**  (avg fake prob = {avg_prob_fake:.2f})")
+    st.markdown(f"### Final Verdict: **{verdict}**  (avg real prob = {avg_prob_fake:.2f})")
 
     result_images = sorted([os.path.join(results_dir, f)
                             for f in os.listdir(results_dir) if f.endswith(".jpg")])[:5]
