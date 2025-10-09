@@ -1,16 +1,15 @@
-import os, random, json, argparse, shutil
+import os, random, json, argparse, shutil, subprocess
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torchvision import datasets, transforms, models
 from torch.utils.data import DataLoader, random_split
+from PIL import Image, UnidentifiedImageError
 
 # ==============================================================
-#                 GOOGLE DRIVE SAFETY SETUP (Optimized)
+#                 GOOGLE DRIVE SAFETY SETUP (Optimized + Verified)
 # ==============================================================
-
-import subprocess
 
 USE_DRIVE = True   # set to False if running locally (non-Colab)
 
@@ -19,25 +18,22 @@ if USE_DRIVE:
     DRIVE_DATA = "/content/drive/MyDrive/celebdf_frames"
     LOCAL_DATA = "/content/celebdf_frames"
 
-    # Copy dataset from Drive → local SSD (much faster than shutil)
-    if not os.path.exists(LOCAL_DATA):
-        print("⏳ Copying dataset from Drive to local SSD (this may take a few minutes)...")
-        try:
-            # Use shell-level cp for better speed and lower overhead
-            subprocess.run(
-                ["cp", "-r", DRIVE_DATA, LOCAL_DATA],
-                check=True
-            )
-            print("✅ Dataset copied successfully to local SSD.")
-        except subprocess.CalledProcessError as e:
-            print("⚠️ Fast copy failed, trying fallback (shutil.copytree)...")
-            import shutil
-            shutil.copytree(DRIVE_DATA, LOCAL_DATA)
-            print("✅ Dataset copied using fallback method.")
-    else:
-        print("✅ Local dataset already exists, skipping copy.")
+    # If local copy missing or clearly incomplete (<1 GB), copy again
+    def dataset_incomplete(path):
+        if not os.path.exists(path):
+            return True
+        size_mb = int(subprocess.getoutput(f"du -sm {path} | cut -f1"))
+        return size_mb < 1000   # less than ~1 GB considered partial
 
-    # Set persistent output/checkpoint paths on Drive
+    if dataset_incomplete(LOCAL_DATA):
+        print("⏳ Copying dataset from Drive to local SSD (fast shell copy)...")
+        if os.path.exists(LOCAL_DATA):
+            shutil.rmtree(LOCAL_DATA)
+        subprocess.run(["cp", "-r", DRIVE_DATA, LOCAL_DATA], check=True)
+        print("✅ Dataset copied successfully.")
+    else:
+        print("✅ Local dataset already exists and looks complete, skipping copy.")
+
     DEFAULT_OUT_DIR = os.path.join(DRIVE_ROOT, "multi_results")
     DEFAULT_CKPT_DIR = os.path.join(DRIVE_ROOT, "checkpoints")
     os.makedirs(DEFAULT_OUT_DIR, exist_ok=True)
@@ -49,6 +45,7 @@ else:
     DEFAULT_CKPT_DIR = "./checkpoints"
     os.makedirs(DEFAULT_OUT_DIR, exist_ok=True)
     os.makedirs(DEFAULT_CKPT_DIR, exist_ok=True)
+
 
 # ==============================================================
 #                 REPRODUCIBILITY
@@ -86,6 +83,26 @@ def get_model(name, num_classes=2, pretrained=True):
 
 
 # ==============================================================
+#                 SAFE DATASET HANDLER
+# ==============================================================
+def safe_image_loader(path):
+    """Skip unreadable or corrupted images instead of crashing."""
+    try:
+        with open(path, "rb") as f:
+            img = Image.open(f)
+            return img.convert("RGB")
+    except (UnidentifiedImageError, OSError) as e:
+        print(f"⚠️ Skipping corrupt image: {path}")
+        return Image.new("RGB", (224, 224), (0, 0, 0))
+
+from torchvision.datasets import ImageFolder
+class SafeImageFolder(ImageFolder):
+    def __init__(self, root, transform=None):
+        super().__init__(root, transform=transform)
+        self.loader = safe_image_loader
+
+
+# ==============================================================
 #                 TRAINING LOOP FOR ONE MODEL
 # ==============================================================
 def train_model(model_name, data_root, out_dir, device, epochs=8, batch_size=64, lr=1e-4, seed=42):
@@ -107,7 +124,8 @@ def train_model(model_name, data_root, out_dir, device, epochs=8, batch_size=64,
     ])
 
     # dataset split
-    full_dataset = datasets.ImageFolder(data_root, transform=transform_train)
+    full_dataset = SafeImageFolder(data_root, transform=transform_train)
+    print(f"Loaded dataset from {data_root} — total images: {len(full_dataset)}")
     n = len(full_dataset)
     n_train = int(0.7 * n)
     n_val = int(0.15 * n)
@@ -116,9 +134,9 @@ def train_model(model_name, data_root, out_dir, device, epochs=8, batch_size=64,
     val_set.dataset.transform = transform_eval
     test_set.dataset.transform = transform_eval
 
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=2)
-    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=2)
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=1)
+    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=1)
 
     model = get_model(model_name, num_classes=2, pretrained=True)
     model = model.to(device)
@@ -131,11 +149,11 @@ def train_model(model_name, data_root, out_dir, device, epochs=8, batch_size=64,
 
     ckpt_dir = os.path.join(DEFAULT_CKPT_DIR, model_name)
     os.makedirs(ckpt_dir, exist_ok=True)
-    model_ckpt_path = os.path.join(ckpt_dir, f"{model_name}_latest.pth")  # always update this file
+    model_ckpt_path = os.path.join(ckpt_dir, f"{model_name}_latest.pth")
     best_model_path = os.path.join(ckpt_dir, f"{model_name}_best.pth")
     history_path = os.path.join(out_dir, f"{model_name}_history.json")
 
-    # Resume from checkpoint if available
+    # Resume if interrupted
     if os.path.exists(model_ckpt_path):
         print(f"🔁 Resuming from checkpoint: {model_ckpt_path}")
         model.load_state_dict(torch.load(model_ckpt_path, map_location=device))
@@ -179,17 +197,13 @@ def train_model(model_name, data_root, out_dir, device, epochs=8, batch_size=64,
 
         print(f"[{model_name}] Epoch {ep+1}/{epochs}  train_acc={train_acc:.4f}  val_acc={val_acc:.4f}")
 
-        # Always save "latest" checkpoint each epoch (Drive-safe)
+        # Always save progress to Drive
         torch.save(model.state_dict(), model_ckpt_path)
-        print(f"💾 Saved latest checkpoint to {model_ckpt_path}")
-
-        # Save "best" checkpoint when validation improves
         if val_acc > best_val:
             best_val = val_acc
             torch.save(model.state_dict(), best_model_path)
             print(f"🏆 New best model saved to {best_model_path}")
 
-        # Save history to Drive after each epoch
         with open(history_path, "w") as f:
             json.dump(history, f, indent=2)
 
@@ -216,7 +230,6 @@ if __name__ == "__main__":
     print("Device:", device)
 
     models_list = [m.strip() for m in args.models.split(",") if m.strip()]
-
     summary = {}
     for mname in models_list:
         ckpt, hist = train_model(mname, args.data_root, args.out_dir, device, epochs=args.epochs,
@@ -225,5 +238,4 @@ if __name__ == "__main__":
 
     with open(os.path.join(args.out_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
-
     print("✅ All training complete. Summary saved to Drive.")
