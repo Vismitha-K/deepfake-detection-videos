@@ -8,32 +8,42 @@ from torch.utils.data import DataLoader, random_split
 from PIL import Image, UnidentifiedImageError
 
 # ==============================================================
-#                 GOOGLE DRIVE SAFETY SETUP (Optimized + Verified)
+#                 GOOGLE DRIVE SAFETY SETUP (Archive-Based)
 # ==============================================================
+
+import subprocess, shutil, os
 
 USE_DRIVE = True   # set to False if running locally (non-Colab)
 
 if USE_DRIVE:
     DRIVE_ROOT = "/content/drive/MyDrive/deepfake-detection-videos"
-    DRIVE_DATA = "/content/drive/MyDrive/celebdf_frames"
+    DRIVE_ARCHIVE = "/content/drive/MyDrive/celebdf_frames.tar.gz"  # compressed dataset
     LOCAL_DATA = "/content/celebdf_frames"
 
-    # If local copy missing or clearly incomplete (<1 GB), copy again
+    # --- Helper: check if dataset incomplete or missing ---
     def dataset_incomplete(path):
         if not os.path.exists(path):
             return True
         size_mb = int(subprocess.getoutput(f"du -sm {path} | cut -f1"))
-        return size_mb < 1000   # less than ~1 GB considered partial
+        return size_mb < 1000   # less than ~1 GB → likely partial extraction
 
+    # --- Extract from archive if needed ---
     if dataset_incomplete(LOCAL_DATA):
-        print("⏳ Copying dataset from Drive to local SSD (fast shell copy)...")
+        print("⏳ Extracting dataset from Drive archive...")
         if os.path.exists(LOCAL_DATA):
             shutil.rmtree(LOCAL_DATA)
-        subprocess.run(["cp", "-r", DRIVE_DATA, LOCAL_DATA], check=True)
-        print("✅ Dataset copied successfully.")
+        try:
+            subprocess.run(
+                ["tar", "-xzf", DRIVE_ARCHIVE, "-C", "/content/"],
+                check=True
+            )
+            print("✅ Dataset extracted successfully to local SSD.")
+        except subprocess.CalledProcessError:
+            raise RuntimeError("❌ Failed to extract dataset from archive. Check that celebdf_frames.tar.gz exists.")
     else:
-        print("✅ Local dataset already exists and looks complete, skipping copy.")
+        print("✅ Local dataset already exists and looks complete, skipping extraction.")
 
+    # --- Define persistent output/checkpoint dirs on Drive ---
     DEFAULT_OUT_DIR = os.path.join(DRIVE_ROOT, "multi_results")
     DEFAULT_CKPT_DIR = os.path.join(DRIVE_ROOT, "checkpoints")
     os.makedirs(DEFAULT_OUT_DIR, exist_ok=True)
@@ -45,7 +55,6 @@ else:
     DEFAULT_CKPT_DIR = "./checkpoints"
     os.makedirs(DEFAULT_OUT_DIR, exist_ok=True)
     os.makedirs(DEFAULT_CKPT_DIR, exist_ok=True)
-
 
 # ==============================================================
 #                 REPRODUCIBILITY
