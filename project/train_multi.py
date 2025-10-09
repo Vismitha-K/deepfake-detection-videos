@@ -7,8 +7,11 @@ from torchvision import datasets, transforms, models
 from torch.utils.data import DataLoader, random_split
 
 # ==============================================================
-#                 GOOGLE DRIVE SAFETY SETUP
+#                 GOOGLE DRIVE SAFETY SETUP (Optimized)
 # ==============================================================
+
+import subprocess
+
 USE_DRIVE = True   # set to False if running locally (non-Colab)
 
 if USE_DRIVE:
@@ -16,25 +19,36 @@ if USE_DRIVE:
     DRIVE_DATA = "/content/drive/MyDrive/celebdf_frames"
     LOCAL_DATA = "/content/celebdf_frames"
 
-    # Copy dataset from Drive → local SSD (faster access)
+    # Copy dataset from Drive → local SSD (much faster than shutil)
     if not os.path.exists(LOCAL_DATA):
-        print("⏳ Copying dataset from Drive to local SSD...")
-        shutil.copytree(DRIVE_DATA, LOCAL_DATA)
-        print("✅ Dataset copied locally.")
+        print("⏳ Copying dataset from Drive to local SSD (this may take a few minutes)...")
+        try:
+            # Use shell-level cp for better speed and lower overhead
+            subprocess.run(
+                ["cp", "-r", DRIVE_DATA, LOCAL_DATA],
+                check=True
+            )
+            print("✅ Dataset copied successfully to local SSD.")
+        except subprocess.CalledProcessError as e:
+            print("⚠️ Fast copy failed, trying fallback (shutil.copytree)...")
+            import shutil
+            shutil.copytree(DRIVE_DATA, LOCAL_DATA)
+            print("✅ Dataset copied using fallback method.")
     else:
         print("✅ Local dataset already exists, skipping copy.")
 
+    # Set persistent output/checkpoint paths on Drive
     DEFAULT_OUT_DIR = os.path.join(DRIVE_ROOT, "multi_results")
     DEFAULT_CKPT_DIR = os.path.join(DRIVE_ROOT, "checkpoints")
     os.makedirs(DEFAULT_OUT_DIR, exist_ok=True)
     os.makedirs(DEFAULT_CKPT_DIR, exist_ok=True)
+
 else:
     LOCAL_DATA = "./data"
     DEFAULT_OUT_DIR = "./multi_results"
     DEFAULT_CKPT_DIR = "./checkpoints"
     os.makedirs(DEFAULT_OUT_DIR, exist_ok=True)
     os.makedirs(DEFAULT_CKPT_DIR, exist_ok=True)
-
 
 # ==============================================================
 #                 REPRODUCIBILITY
