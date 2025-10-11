@@ -4,19 +4,35 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torchvision import datasets, transforms, models
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 from PIL import Image, UnidentifiedImageError
 
 # ==============================================================
-#                 GOOGLE DRIVE SAFETY SETUP (Direct-from-Drive)
+#                 GOOGLE DRIVE SAFETY SETUP
 # ==============================================================
 
-USE_DRIVE = True   # set False if running locally (non-Colab)
+USE_DRIVE = True   # set to False if running locally (non-Colab)
 
 if USE_DRIVE:
-    DRIVE_ROOT  = "/content/drive/MyDrive/deepfake-detection-videos"
-    DRIVE_DATA  = "/content/drive/MyDrive/celebdf_frames"   # train directly from Drive
-    LOCAL_DATA  = DRIVE_DATA
+    DRIVE_ROOT = "/content/drive/MyDrive/deepfake-detection-videos"
+    DRIVE_DATA = "/content/drive/MyDrive/celebdf_frames"
+    LOCAL_DATA = "/content/celebdf_frames"
+
+    def dataset_incomplete(path):
+        if not os.path.exists(path):
+            return True
+        size_mb = int(subprocess.getoutput(f"du -sm {path} | cut -f1"))
+        return size_mb < 1000   # less than ~1 GB → incomplete copy
+
+    if dataset_incomplete(LOCAL_DATA):
+        print("⏳ Copying dataset from Drive to local SSD...")
+        if os.path.exists(LOCAL_DATA):
+            shutil.rmtree(LOCAL_DATA)
+        shutil.copytree(DRIVE_DATA, LOCAL_DATA)
+        print("✅ Dataset copied to local SSD.")
+    else:
+        print("✅ Local dataset already exists and looks complete, skipping copy.")
+
     DEFAULT_OUT_DIR = os.path.join(DRIVE_ROOT, "multi_results")
     DEFAULT_CKPT_DIR = os.path.join(DRIVE_ROOT, "checkpoints")
     os.makedirs(DEFAULT_OUT_DIR, exist_ok=True)
@@ -28,10 +44,10 @@ else:
     os.makedirs(DEFAULT_OUT_DIR, exist_ok=True)
     os.makedirs(DEFAULT_CKPT_DIR, exist_ok=True)
 
+
 # ==============================================================
 #                 REPRODUCIBILITY
 # ==============================================================
-
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
@@ -44,7 +60,6 @@ def set_seed(seed=42):
 # ==============================================================
 #                 MODEL FACTORY
 # ==============================================================
-
 def get_model(name, num_classes=2, pretrained=True):
     name = name.lower()
     if name == "resnet50":
@@ -66,11 +81,9 @@ def get_model(name, num_classes=2, pretrained=True):
 
 
 # ==============================================================
-#                 SAFE DATASET HANDLER
+#                 SAFE IMAGE LOADER
 # ==============================================================
-
 def safe_image_loader(path):
-    """Skip unreadable or corrupted images instead of crashing."""
     try:
         with open(path, "rb") as f:
             img = Image.open(f)
@@ -78,6 +91,7 @@ def safe_image_loader(path):
     except (UnidentifiedImageError, OSError):
         print(f"⚠️ Skipping corrupt image: {path}")
         return Image.new("RGB", (224, 224), (0, 0, 0))
+
 
 from torchvision.datasets import ImageFolder
 class SafeImageFolder(ImageFolder):
@@ -87,10 +101,9 @@ class SafeImageFolder(ImageFolder):
 
 
 # ==============================================================
-#                 TRAINING LOOP FOR ONE MODEL
+#                 TRAINING LOOP
 # ==============================================================
-
-def train_model(model_name, data_root, out_dir, device, epochs=8, batch_size=32, lr=1e-4, seed=42):
+def train_model(model_name, data_root, out_dir, device, epochs=8, batch_size=64, lr=1e-4, seed=42):
     set_seed(seed)
     os.makedirs(out_dir, exist_ok=True)
     print(f"\n=== Training {model_name} ===")
@@ -108,27 +121,67 @@ def train_model(model_name, data_root, out_dir, device, epochs=8, batch_size=32,
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
 
-    # dataset split
-    full_dataset = SafeImageFolder(data_root, transform=transform_train)
-    print(f"📂 Loaded dataset from: {data_root}")
-    print(f"🖼️ Total images found: {len(full_dataset)}")
+    # --- VIDEO-LEVEL SPLIT ---
+    full_folder = SafeImageFolder(data_root, transform=None)
+    samples = full_folder.samples
+    print(f"📂 Total frames found: {len(samples)}")
 
-    n = len(full_dataset)
-    n_train = int(0.7 * n)
-    n_val = int(0.15 * n)
-    n_test = n - n_train - n_val
-    train_set, val_set, test_set = random_split(
-        full_dataset, [n_train, n_val, n_test],
-        generator=torch.Generator().manual_seed(seed)
-    )
-    val_set.dataset.transform = transform_eval
-    test_set.dataset.transform = transform_eval
+    from torch.utils.data import Dataset
 
-    # Drive FUSE = num_workers=0
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=False)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=0)
-    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=0)
+    class FramesDataset(Dataset):
+        def __init__(self, samples, transform=None, loader=None):
+            self.samples = samples
+            self.transform = transform
+            self.loader = loader if loader is not None else full_folder.loader
+        def __len__(self):
+            return len(self.samples)
+        def __getitem__(self, idx):
+            path, label = self.samples[idx]
+            img = self.loader(path)
+            if self.transform:
+                img = self.transform(img)
+            return img, label
 
+    # Group frames by video ID (filename prefix before last underscore)
+    video_to_indices = {}
+    for i, (p, lbl) in enumerate(samples):
+        name = os.path.basename(p)
+        vid = "_".join(name.split("_")[:-1]) if "_" in name else name
+        video_to_indices.setdefault(vid, []).append(i)
+
+    video_ids = list(video_to_indices.keys())
+    random.shuffle(video_ids)
+    n = len(video_ids)
+    n_train, n_val = int(0.7 * n), int(0.15 * n)
+    train_vids = video_ids[:n_train]
+    val_vids = video_ids[n_train:n_train + n_val]
+    test_vids = video_ids[n_train + n_val:]
+
+    def collect(vlist):
+        idx = []
+        for v in vlist:
+            idx.extend(video_to_indices[v])
+        return idx
+
+    train_idx, val_idx, test_idx = collect(train_vids), collect(val_vids), collect(test_vids)
+
+    assert set(train_idx).isdisjoint(val_idx)
+    assert set(train_idx).isdisjoint(test_idx)
+    assert set(val_idx).isdisjoint(test_idx)
+
+    train_dataset = FramesDataset([samples[i] for i in train_idx], transform=transform_train)
+    val_dataset = FramesDataset([samples[i] for i in val_idx], transform=transform_eval)
+    test_dataset = FramesDataset([samples[i] for i in test_idx], transform=transform_eval)
+    print(f"📊 Video-level split → Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
+
+    num_workers = 4 if data_root.startswith("/content/") else 0
+    pin_memory = True if (device.type == "cuda" and data_root.startswith("/content/")) else False
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+
+    # model setup
     model = get_model(model_name, num_classes=2, pretrained=True)
     model = model.to(device)
 
@@ -140,22 +193,16 @@ def train_model(model_name, data_root, out_dir, device, epochs=8, batch_size=32,
 
     ckpt_dir = os.path.join(DEFAULT_CKPT_DIR, model_name)
     os.makedirs(ckpt_dir, exist_ok=True)
-    full_ckpt_path = os.path.join(ckpt_dir, f"{model_name}_resume.pth")
+    model_ckpt_path = os.path.join(ckpt_dir, f"{model_name}_resume.pth")
     best_model_path = os.path.join(ckpt_dir, f"{model_name}_best.pth")
     history_path = os.path.join(out_dir, f"{model_name}_history.json")
 
-    # Resume full state if checkpoint exists
-    start_epoch = 0
-    if os.path.exists(full_ckpt_path):
-        print(f"🔁 Resuming from saved checkpoint: {full_ckpt_path}")
-        checkpoint = torch.load(full_ckpt_path, map_location=device)
-        model.load_state_dict(checkpoint["model_state"])
-        optimizer.load_state_dict(checkpoint["optimizer_state"])
-        best_val = checkpoint.get("best_val", 0.0)
-        start_epoch = checkpoint.get("epoch", 0) + 1
-        print(f"Resuming from epoch {start_epoch} with best val acc = {best_val:.4f}")
+    # Resume if interrupted
+    if os.path.exists(model_ckpt_path):
+        print(f"🔁 Resuming from checkpoint: {model_ckpt_path}")
+        model.load_state_dict(torch.load(model_ckpt_path, map_location=device))
 
-    for ep in range(start_epoch, epochs):
+    for ep in range(epochs):
         model.train()
         correct, total, running_loss = 0, 0, 0.0
         for imgs, labels in train_loader:
@@ -194,21 +241,13 @@ def train_model(model_name, data_root, out_dir, device, epochs=8, batch_size=32,
 
         print(f"[{model_name}] Epoch {ep+1}/{epochs}  train_acc={train_acc:.4f}  val_acc={val_acc:.4f}")
 
-        # Save full checkpoint each epoch (model + optimizer + epoch)
-        torch.save({
-            "epoch": ep,
-            "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "best_val": best_val
-        }, full_ckpt_path)
-
-        # Save best model separately
+        # Always save progress
+        torch.save(model.state_dict(), model_ckpt_path)
         if val_acc > best_val:
             best_val = val_acc
             torch.save(model.state_dict(), best_model_path)
             print(f"🏆 New best model saved to {best_model_path}")
 
-        # Save history to Drive
         with open(history_path, "w") as f:
             json.dump(history, f, indent=2)
 
@@ -219,14 +258,13 @@ def train_model(model_name, data_root, out_dir, device, epochs=8, batch_size=32,
 # ==============================================================
 #                 MAIN CLI
 # ==============================================================
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--models", type=str, default="resnet50,densenet121,mobilenet_v3_large,efficientnet_b0")
-    parser.add_argument("--data-root", type=str, default=LOCAL_DATA)
+    parser.add_argument("--data-root", type=str, default="/content/celebdf_frames")
     parser.add_argument("--out-dir", type=str, default=DEFAULT_OUT_DIR)
     parser.add_argument("--epochs", type=int, default=8)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -239,13 +277,17 @@ if __name__ == "__main__":
     summary = {}
     for mname in models_list:
         ckpt, hist = train_model(
-            mname, args.data_root, args.out_dir, device,
-            epochs=args.epochs, batch_size=args.batch_size,
-            lr=args.lr, seed=args.seed
+            mname,
+            args.data_root,
+            args.out_dir,
+            device,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            seed=args.seed
         )
         summary[mname] = {"ckpt": ckpt, "history": hist}
 
     with open(os.path.join(args.out_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
-
     print("✅ All training complete. Summary saved to Drive.")
