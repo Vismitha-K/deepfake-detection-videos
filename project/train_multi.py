@@ -8,47 +8,19 @@ from torch.utils.data import DataLoader, random_split
 from PIL import Image, UnidentifiedImageError
 
 # ==============================================================
-#                 GOOGLE DRIVE SAFETY SETUP (Archive-Based)
+#                 GOOGLE DRIVE SAFETY SETUP (Direct-from-Drive)
 # ==============================================================
 
-import subprocess, shutil, os
-
-USE_DRIVE = True   # set to False if running locally (non-Colab)
+USE_DRIVE = True   # set False if running locally (non-Colab)
 
 if USE_DRIVE:
-    DRIVE_ROOT = "/content/drive/MyDrive/deepfake-detection-videos"
-    DRIVE_ARCHIVE = "/content/drive/MyDrive/celebdf_frames.tar.gz"  # compressed dataset
-    LOCAL_DATA = "/content/celebdf_frames"
-
-    # --- Helper: check if dataset incomplete or missing ---
-    def dataset_incomplete(path):
-        if not os.path.exists(path):
-            return True
-        size_mb = int(subprocess.getoutput(f"du -sm {path} | cut -f1"))
-        return size_mb < 1000   # less than ~1 GB → likely partial extraction
-
-    # --- Extract from archive if needed ---
-    if dataset_incomplete(LOCAL_DATA):
-        print("⏳ Extracting dataset from Drive archive...")
-        if os.path.exists(LOCAL_DATA):
-            shutil.rmtree(LOCAL_DATA)
-        try:
-            subprocess.run(
-                ["tar", "-xzf", DRIVE_ARCHIVE, "-C", "/content/"],
-                check=True
-            )
-            print("✅ Dataset extracted successfully to local SSD.")
-        except subprocess.CalledProcessError:
-            raise RuntimeError("❌ Failed to extract dataset from archive. Check that celebdf_frames.tar.gz exists.")
-    else:
-        print("✅ Local dataset already exists and looks complete, skipping extraction.")
-
-    # --- Define persistent output/checkpoint dirs on Drive ---
+    DRIVE_ROOT  = "/content/drive/MyDrive/deepfake-detection-videos"
+    DRIVE_DATA  = "/content/drive/MyDrive/celebdf_frames"   # train directly from Drive
+    LOCAL_DATA  = DRIVE_DATA
     DEFAULT_OUT_DIR = os.path.join(DRIVE_ROOT, "multi_results")
     DEFAULT_CKPT_DIR = os.path.join(DRIVE_ROOT, "checkpoints")
     os.makedirs(DEFAULT_OUT_DIR, exist_ok=True)
     os.makedirs(DEFAULT_CKPT_DIR, exist_ok=True)
-
 else:
     LOCAL_DATA = "./data"
     DEFAULT_OUT_DIR = "./multi_results"
@@ -59,6 +31,7 @@ else:
 # ==============================================================
 #                 REPRODUCIBILITY
 # ==============================================================
+
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
@@ -71,6 +44,7 @@ def set_seed(seed=42):
 # ==============================================================
 #                 MODEL FACTORY
 # ==============================================================
+
 def get_model(name, num_classes=2, pretrained=True):
     name = name.lower()
     if name == "resnet50":
@@ -94,13 +68,14 @@ def get_model(name, num_classes=2, pretrained=True):
 # ==============================================================
 #                 SAFE DATASET HANDLER
 # ==============================================================
+
 def safe_image_loader(path):
     """Skip unreadable or corrupted images instead of crashing."""
     try:
         with open(path, "rb") as f:
             img = Image.open(f)
             return img.convert("RGB")
-    except (UnidentifiedImageError, OSError) as e:
+    except (UnidentifiedImageError, OSError):
         print(f"⚠️ Skipping corrupt image: {path}")
         return Image.new("RGB", (224, 224), (0, 0, 0))
 
@@ -114,7 +89,8 @@ class SafeImageFolder(ImageFolder):
 # ==============================================================
 #                 TRAINING LOOP FOR ONE MODEL
 # ==============================================================
-def train_model(model_name, data_root, out_dir, device, epochs=8, batch_size=64, lr=1e-4, seed=42):
+
+def train_model(model_name, data_root, out_dir, device, epochs=8, batch_size=32, lr=1e-4, seed=42):
     set_seed(seed)
     os.makedirs(out_dir, exist_ok=True)
     print(f"\n=== Training {model_name} ===")
@@ -134,18 +110,24 @@ def train_model(model_name, data_root, out_dir, device, epochs=8, batch_size=64,
 
     # dataset split
     full_dataset = SafeImageFolder(data_root, transform=transform_train)
-    print(f"Loaded dataset from {data_root} — total images: {len(full_dataset)}")
+    print(f"📂 Loaded dataset from: {data_root}")
+    print(f"🖼️ Total images found: {len(full_dataset)}")
+
     n = len(full_dataset)
     n_train = int(0.7 * n)
     n_val = int(0.15 * n)
     n_test = n - n_train - n_val
-    train_set, val_set, test_set = random_split(full_dataset, [n_train, n_val, n_test], generator=torch.Generator().manual_seed(seed))
+    train_set, val_set, test_set = random_split(
+        full_dataset, [n_train, n_val, n_test],
+        generator=torch.Generator().manual_seed(seed)
+    )
     val_set.dataset.transform = transform_eval
     test_set.dataset.transform = transform_eval
 
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=1)
-    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=1)
+    # Drive FUSE = num_workers=0
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=False)
+    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=0)
+    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=0)
 
     model = get_model(model_name, num_classes=2, pretrained=True)
     model = model.to(device)
@@ -158,16 +140,22 @@ def train_model(model_name, data_root, out_dir, device, epochs=8, batch_size=64,
 
     ckpt_dir = os.path.join(DEFAULT_CKPT_DIR, model_name)
     os.makedirs(ckpt_dir, exist_ok=True)
-    model_ckpt_path = os.path.join(ckpt_dir, f"{model_name}_latest.pth")
+    full_ckpt_path = os.path.join(ckpt_dir, f"{model_name}_resume.pth")
     best_model_path = os.path.join(ckpt_dir, f"{model_name}_best.pth")
     history_path = os.path.join(out_dir, f"{model_name}_history.json")
 
-    # Resume if interrupted
-    if os.path.exists(model_ckpt_path):
-        print(f"🔁 Resuming from checkpoint: {model_ckpt_path}")
-        model.load_state_dict(torch.load(model_ckpt_path, map_location=device))
+    # Resume full state if checkpoint exists
+    start_epoch = 0
+    if os.path.exists(full_ckpt_path):
+        print(f"🔁 Resuming from saved checkpoint: {full_ckpt_path}")
+        checkpoint = torch.load(full_ckpt_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state"])
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+        best_val = checkpoint.get("best_val", 0.0)
+        start_epoch = checkpoint.get("epoch", 0) + 1
+        print(f"Resuming from epoch {start_epoch} with best val acc = {best_val:.4f}")
 
-    for ep in range(epochs):
+    for ep in range(start_epoch, epochs):
         model.train()
         correct, total, running_loss = 0, 0, 0.0
         for imgs, labels in train_loader:
@@ -206,13 +194,21 @@ def train_model(model_name, data_root, out_dir, device, epochs=8, batch_size=64,
 
         print(f"[{model_name}] Epoch {ep+1}/{epochs}  train_acc={train_acc:.4f}  val_acc={val_acc:.4f}")
 
-        # Always save progress to Drive
-        torch.save(model.state_dict(), model_ckpt_path)
+        # Save full checkpoint each epoch (model + optimizer + epoch)
+        torch.save({
+            "epoch": ep,
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "best_val": best_val
+        }, full_ckpt_path)
+
+        # Save best model separately
         if val_acc > best_val:
             best_val = val_acc
             torch.save(model.state_dict(), best_model_path)
             print(f"🏆 New best model saved to {best_model_path}")
 
+        # Save history to Drive
         with open(history_path, "w") as f:
             json.dump(history, f, indent=2)
 
@@ -223,13 +219,14 @@ def train_model(model_name, data_root, out_dir, device, epochs=8, batch_size=64,
 # ==============================================================
 #                 MAIN CLI
 # ==============================================================
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--models", type=str, default="resnet50,densenet121,mobilenet_v3_large,efficientnet_b0")
     parser.add_argument("--data-root", type=str, default=LOCAL_DATA)
     parser.add_argument("--out-dir", type=str, default=DEFAULT_OUT_DIR)
     parser.add_argument("--epochs", type=int, default=8)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -241,10 +238,14 @@ if __name__ == "__main__":
     models_list = [m.strip() for m in args.models.split(",") if m.strip()]
     summary = {}
     for mname in models_list:
-        ckpt, hist = train_model(mname, args.data_root, args.out_dir, device, epochs=args.epochs,
-                                 batch_size=args.batch_size, lr=args.lr, seed=args.seed)
+        ckpt, hist = train_model(
+            mname, args.data_root, args.out_dir, device,
+            epochs=args.epochs, batch_size=args.batch_size,
+            lr=args.lr, seed=args.seed
+        )
         summary[mname] = {"ckpt": ckpt, "history": hist}
 
     with open(os.path.join(args.out_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
+
     print("✅ All training complete. Summary saved to Drive.")
